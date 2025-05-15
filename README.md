@@ -1,6 +1,6 @@
 # Investec ML Reports
 
-**Investec ML Reports** is a Python-based application that connects to the Investec Programmable Banking API, fetches all outgoing (DEBIT) transactions for a user, stores them in a local database, and uses machine learning (Prophet) to forecast future monthly spending. The project is built with FastAPI, SQLAlchemy, and Prophet, and is designed for easy deployment and extensibility.
+**Investec ML Reports (Alpha Pre-production)** is a Python-based application that connects to the Investec Programmable Banking API, fetches all outgoing (DEBIT) transactions for a user, stores them in a local database, and uses machine learning (Prophet) to forecast future monthly spending. The project is built with FastAPI, SQLAlchemy, and Prophet, and is designed for easy deployment and extensibility.
 
 ---
 
