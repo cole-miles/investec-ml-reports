@@ -5,6 +5,8 @@ from .database import SessionLocal, engine
 from .investec_api import get_access_token, get_account_id, get_transactions
 from datetime import datetime
 from .ml import forecast_spending
+from tqdm import tqdm
+import time
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -27,20 +29,28 @@ async def fetch_and_save_transactions(user_id: int, db: Session = Depends(get_db
         raise HTTPException(status_code=404, detail="User not found")
 
     # Fetch transactions from Investec API
+    print(f"Starting transaction fetch for user {user_id}...")
     access_token = get_access_token()
     account_id = get_account_id(access_token)
     transactions = get_transactions(account_id, access_token)
 
     # Process and save transactions
-    for transaction_data in transactions:
-        transaction = schemas.TransactionCreate(
-            date=datetime.strptime(transaction_data["transactionDate"], "%Y-%m-%d"),
-            amount=float(transaction_data["amount"]),
-            description=transaction_data["description"]
-        )
-        crud.create_transaction(db=db, transaction=transaction, user_id=user_id)
+    print("\nSaving transactions to database...")
+    from tqdm import tqdm
+    with tqdm(total=len(transactions), desc="Saving transactions") as pbar:
+        for transaction_data in transactions:
+            transaction = schemas.TransactionCreate(
+                date=datetime.strptime(transaction_data["transactionDate"], "%Y-%m-%d"),
+                amount=float(transaction_data["amount"]),
+                description=transaction_data["description"]
+            )
+            crud.create_transaction(db=db, transaction=transaction, user_id=user_id)
+            pbar.update(1)
 
-    return {"message": "Transactions fetched and saved successfully"}
+    return {
+        "message": "Transactions fetched and saved successfully",
+        "total_transactions": len(transactions)
+    }
 
 # API endpoint to run the report
 @app.get("/users/{user_id}/report")
