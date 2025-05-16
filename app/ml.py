@@ -1,164 +1,171 @@
 import pandas as pd
 import numpy as np
-from prophet import Prophet
-from datetime import datetime
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from sklearn.linear_model import HuberRegressor
+from typing import List, Dict
 
-def remove_outliers(df, z_thresh=2.5):
-    """
-    Removes rows where 'y' is more than z_thresh standard deviations from the mean.
-    Returns both cleaned data and information about removed outliers.
-    """
-    mean = df['y'].mean()
-    std = df['y'].std()
-    z_scores = np.abs((df['y'] - mean) / std)
+def remove_daily_outliers(df, method='iqr', k=1.5):
+    daily = df.groupby(df['ds'].dt.date)['y'].sum().reset_index()
+    daily['ds'] = pd.to_datetime(daily['ds'])
 
-    outliers = df[z_scores >= z_thresh].copy()
-    df_clean = df[z_scores < z_thresh].copy()
+    if method == 'iqr':
+        Q1 = daily['y'].quantile(0.25)
+        Q3 = daily['y'].quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - k * IQR
+        upper_bound = Q3 + k * IQR
+        outliers = daily[(daily['y'] < lower_bound) | (daily['y'] > upper_bound)]
+        daily_clean = daily[(daily['y'] >= lower_bound) & (daily['y'] <= upper_bound)]
+        print(f"\n[Outlier Removal] IQR method: Removed {len(outliers)} daily outliers.")
+        if len(outliers) > 0:
+            print("Outlier days removed:")
+            for _, row in outliers.iterrows():
+                print(f"  {row['ds'].strftime('%Y-%m-%d')}: R{row['y']:,.2f}")
+    elif method == 'zscore':
+        mean = daily['y'].mean()
+        std = daily['y'].std()
+        z_scores = np.abs((daily['y'] - mean) / std)
+        outliers = daily[z_scores > k]
+        daily_clean = daily[z_scores <= k]
+        print(f"\n[Outlier Removal] Z-score method: Removed {len(outliers)} daily outliers.")
+        if len(outliers) > 0:
+            print("Outlier days removed:")
+            for _, row in outliers.iterrows():
+                print(f"  {row['ds'].strftime('%Y-%m-%d')}: R{row['y']:,.2f}")
+    else:
+        raise ValueError("Unknown method for outlier removal.")
 
-    print("\nOutlier Detection Results:")
-    print(f"Original months: {len(df)}")
-    print(f"Months after outlier removal: {len(df_clean)}")
-    if len(outliers) > 0:
-        print("\nOutlier months removed:")
-        for _, row in outliers.iterrows():
-            print(f"Date: {row['ds'].strftime('%Y-%m')}, Amount: R{row['y']:,.2f}")
+    return daily_clean
 
-    return df_clean
+def cap_monthly_outliers(monthly, upper_quantile=0.95):
+    upper = monthly['y'].quantile(upper_quantile)
+    monthly['y'] = np.clip(monthly['y'], None, upper)
+    print(f"\n[Monthly Capping] Capped monthly spend at R{upper:,.2f}")
+    return monthly
 
-def cap_outliers(df, upper_quantile=0.95):
-    """
-    Caps spending at the specified quantile instead of removing outliers.
-    """
-    upper = df['y'].quantile(upper_quantile)
-    original_values = df[df['y'] > upper].copy()
-    df.loc[df['y'] > upper, 'y'] = upper
-
-    print("\nOutlier Capping Results:")
-    print(f"Capping threshold: R{upper:,.2f}")
-    if len(original_values) > 0:
-        print("\nCapped months:")
-        for _, row in original_values.iterrows():
-            print(f"Date: {row['ds'].strftime('%Y-%m')}, Original: R{row['y']:,.2f}, Capped to: R{upper:,.2f}")
-
-    return df
-
-def prepare_monthly_data(transactions):
-    """
-    Prepares transaction data by aggregating into monthly totals.
-    Only considers outgoing transactions (negative amounts).
-    """
-    # Convert transactions list to DataFrame
+def prepare_monthly_data(transactions: List[Dict], cap_quantile=0.95):
     df = pd.DataFrame(transactions)
-
-    # Convert date strings to datetime
     df['ds'] = pd.to_datetime(df['date'])
-
-    # Convert amounts to absolute values (since they're already negative for outgoing)
     df['y'] = df['amount'].abs()
 
-    # Group by month and sum
-    monthly = df.groupby(pd.Grouper(key='ds', freq='ME'))['y'].sum().reset_index()
+    daily_clean = remove_daily_outliers(df, method='iqr', k=1.5)
 
-    # Sort by date
+    # Use 'ME' for month-end to avoid deprecation warning
+    monthly = daily_clean.groupby(pd.Grouper(key='ds', freq='ME'))['y'].sum().reset_index()
     monthly = monthly.sort_values('ds')
+    monthly = monthly.set_index('ds').asfreq('ME').fillna(monthly['y'].median()).reset_index()
+    monthly = cap_monthly_outliers(monthly, upper_quantile=cap_quantile)
 
-    # Fill any missing months with the mean
-    monthly = monthly.set_index('ds').asfreq('ME').fillna(monthly['y'].mean()).reset_index()
-
-    print("\nMonthly Spending Summary:")
+    print("\n[Monthly Spending Summary] (after daily outlier removal and capping):")
     print(f"Period: {monthly['ds'].min().strftime('%Y-%m')} to {monthly['ds'].max().strftime('%Y-%m')}")
     print(f"Average monthly spending: R{monthly['y'].mean():,.2f}")
     print(f"Median monthly spending: R{monthly['y'].median():,.2f}")
     print(f"Minimum month: R{monthly['y'].min():,.2f}")
     print(f"Maximum month: R{monthly['y'].max():,.2f}")
-
+    print(monthly)
     return monthly
 
-def create_prophet_model(df):
-    """
-    Creates and fits a Prophet model with appropriate parameters for monthly spending.
-    """
-    model = Prophet(
-        yearly_seasonality=True,
-        weekly_seasonality=False,
-        daily_seasonality=False,
-        interval_width=0.95,
-        growth='linear',
-        seasonality_mode='multiplicative'
+def forecast_holt_winters(monthly, forecast_periods=1):
+    model = ExponentialSmoothing(
+        monthly['y'],
+        trend='add',
+        seasonal=None,
+        initialization_method='estimated'
     )
+    fit = model.fit()
+    forecast = fit.forecast(forecast_periods)
+    # Confidence interval: use 25th and 75th percentiles of historical data as a proxy
+    ci_lower = monthly['y'].quantile(0.25)
+    ci_upper = monthly['y'].quantile(0.75)
+    print(f"\n[Holt-Winters] Next month forecast: R{forecast.iloc[0]:,.2f}")
+    return float(forecast.iloc[0]), float(ci_lower), float(ci_upper)
 
-    model.fit(df)
-    return model
+def create_lagged_features(monthly, lags=3):
+    df = monthly.copy()
+    for lag in range(1, lags+1):
+        df[f'lag_{lag}'] = df['y'].shift(lag)
+    df = df.dropna()
+    return df
 
-def make_forecast(model, df, periods=3):
-    """
-    Generates a forecast for the next few months.
-    Returns both the forecast and some statistics.
-    """
-    # Make future dataframe for next 3 months
-    future = model.make_future_dataframe(periods=periods, freq='ME')
+def forecast_robust_regression(monthly, lags=3):
+    df = create_lagged_features(monthly, lags)
+    if df.empty:
+        raise ValueError("Not enough data for robust regression.")
+    X = df[[f'lag_{i}' for i in range(1, lags+1)]].values
+    y = df['y'].values
+    model = HuberRegressor().fit(X, y)
+    last_lags = monthly['y'].iloc[-lags:].values[::-1]
+    pred = model.predict([last_lags])[0]
+    # Confidence interval: use 25th and 75th percentiles of historical data as a proxy
+    ci_lower = monthly['y'].quantile(0.25)
+    ci_upper = monthly['y'].quantile(0.75)
+    print(f"\n[Robust Regression] Next month forecast: R{pred:,.2f}")
+    return float(pred), float(ci_lower), float(ci_upper)
 
-    # Make forecast
-    forecast = model.predict(future)
+def forecast_spending(transactions: List[Dict]):
+    monthly = prepare_monthly_data(transactions)
+    avg_monthly = float(monthly['y'].mean())
+    last_month = float(monthly['y'].iloc[-1]) if len(monthly) > 0 else 0.0
 
-    # Get the last actual value from the original data
-    last_actual = df['y'].iloc[-1]
+    if len(monthly) < 6:
+        print("\n[Fallback] Not enough data, using median.")
+        pred = float(monthly['y'].median())
+        ci_lower = float(monthly['y'].quantile(0.25))
+        ci_upper = float(monthly['y'].quantile(0.75))
+        trend_pct = 0.0
+        return {
+            'predicted_spending': pred,
+            'confidence_interval': {
+                'lower': ci_lower,
+                'upper': ci_upper
+            },
+            'trend_percentage': trend_pct,
+            'average_monthly_spending': avg_monthly
+        }
 
-    # Get predictions for future months
-    predictions = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail(periods)
+    # Try Exponential Smoothing
+    hw_pred, hw_lower, hw_upper = None, None, None
+    try:
+        hw_pred, hw_lower, hw_upper = forecast_holt_winters(monthly)
+    except Exception as e:
+        print(f"[Holt-Winters] Error: {e}")
 
-    # Calculate average monthly spending from original data
-    average_spending = df['y'].mean()
+    # Try Robust Regression
+    rr_pred, rr_lower, rr_upper = None, None, None
+    try:
+        rr_pred, rr_lower, rr_upper = forecast_robust_regression(monthly)
+    except Exception as e:
+        print(f"[Robust Regression] Error: {e}")
 
-    print("\nForecast Summary:")
-    print(f"Next month's predicted spending: R{predictions['yhat'].iloc[0]:,.2f}")
-    print(f"Confidence interval: R{predictions['yhat_lower'].iloc[0]:,.2f} to R{predictions['yhat_upper'].iloc[0]:,.2f}")
+    preds = []
+    lowers = []
+    uppers = []
+    if hw_pred is not None and hw_pred > 0:
+        preds.append(hw_pred)
+        lowers.append(hw_lower)
+        uppers.append(hw_upper)
+    if rr_pred is not None and rr_pred > 0:
+        preds.append(rr_pred)
+        lowers.append(rr_lower)
+        uppers.append(rr_upper)
+
+    if preds:
+        pred = float(np.mean(preds))
+        ci_lower = float(np.min(lowers))
+        ci_upper = float(np.max(uppers))
+        trend_pct = ((pred - last_month) / last_month * 100) if last_month > 0 else 0.0
+    else:
+        pred = float(monthly['y'].median())
+        ci_lower = float(monthly['y'].quantile(0.25))
+        ci_upper = float(monthly['y'].quantile(0.75))
+        trend_pct = 0.0
 
     return {
-        'forecast_df': forecast,
-        'predictions': predictions,
-        'last_actual': last_actual,
-        'average_monthly': average_spending
-    }
-
-def forecast_spending(transactions):
-    """
-    Main function to forecast spending based on transaction history.
-    """
-    if not transactions:
-        raise ValueError("No transactions provided for forecasting")
-
-    # Prepare monthly data
-    monthly_data = prepare_monthly_data(transactions)
-
-    if len(monthly_data) < 3:
-        raise ValueError("Need at least 3 months of data for forecasting")
-
-    monthly_data = remove_outliers(monthly_data, z_thresh=2.5)
-
-    # Create and fit model
-    model = create_prophet_model(monthly_data)
-
-    # Make forecast
-    forecast_results = make_forecast(model, monthly_data)
-
-    # Get next month's prediction
-    next_month_prediction = forecast_results['predictions']['yhat'].iloc[0]
-
-    # Calculate confidence interval
-    confidence_lower = forecast_results['predictions']['yhat_lower'].iloc[0]
-    confidence_upper = forecast_results['predictions']['yhat_upper'].iloc[0]
-
-    # Calculate trend (percentage change from last actual)
-    trend_pct = ((next_month_prediction - forecast_results['last_actual'])
-                 / forecast_results['last_actual'] * 100)
-
-    return {
-        'predicted_spending': float(next_month_prediction),
+        'predicted_spending': pred,
         'confidence_interval': {
-            'lower': float(confidence_lower),
-            'upper': float(confidence_upper)
+            'lower': ci_lower,
+            'upper': ci_upper
         },
-        'trend_percentage': float(trend_pct),
-        'average_monthly_spending': float(forecast_results['average_monthly'])
+        'trend_percentage': trend_pct,
+        'average_monthly_spending': avg_monthly
     }
